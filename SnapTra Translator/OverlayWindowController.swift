@@ -1225,9 +1225,9 @@ final class OverlayWindowController: NSWindowController {
     }
 
     /// 设置窗口是否接受鼠标事件
-    func setInteractive(_ interactive: Bool) {
+    func setInteractive(_ interactive: Bool, requestsKeyboardFocus: Bool = true) {
         window?.ignoresMouseEvents = !interactive
-        if interactive {
+        if interactive, requestsKeyboardFocus {
             window?.makeKey()
         }
     }

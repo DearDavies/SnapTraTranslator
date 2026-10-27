@@ -10,23 +10,32 @@ nonisolated enum SelectedTextSnapshotSource: Equatable, Sendable {
 
 nonisolated struct SelectedTextSnapshot: Equatable, Sendable {
     let text: String
+    let rawText: String
     let selectedRange: NSRange
     let bounds: CGRect?
     let sourceAppIdentifier: String?
+    let sourceProcessIdentifier: pid_t?
     let source: SelectedTextSnapshotSource
+    let replacementContextID: UUID?
 
     init(
         text: String,
         selectedRange: NSRange,
         bounds: CGRect?,
         sourceAppIdentifier: String?,
-        source: SelectedTextSnapshotSource = .accessibility
+        source: SelectedTextSnapshotSource = .accessibility,
+        rawText: String? = nil,
+        sourceProcessIdentifier: pid_t? = nil,
+        replacementContextID: UUID? = nil
     ) {
         self.text = text
+        self.rawText = rawText ?? text
         self.selectedRange = selectedRange
         self.bounds = bounds
         self.sourceAppIdentifier = sourceAppIdentifier
+        self.sourceProcessIdentifier = sourceProcessIdentifier
         self.source = source
+        self.replacementContextID = replacementContextID
     }
 }
 
@@ -48,33 +57,66 @@ nonisolated enum ClipboardFallbackPolicy {
     }
 }
 
+@MainActor
+enum ClipboardSelectionOperationGate {
+    private static var isActive = false
+
+    static func acquire() -> Bool {
+        guard !isActive else { return false }
+        isActive = true
+        return true
+    }
+
+    static func release() {
+        isActive = false
+    }
+}
+
 nonisolated final class SelectedTextService: @unchecked Sendable {
     private let probeExecutor: SelectedTextProbeExecutor
     private let diagnostics: SelectedTextDiagnostics
     private let probeObserver: @Sendable (SelectedTextProbeObservation) -> Void
+    private let replacementEnabled: Bool
+    private var replacementContexts: [UUID: ReplacementContext] = [:]
+
+    private struct ReplacementContext {
+        let application: AXUIElement
+        let window: AXUIElement
+        let element: AXUIElement
+        let processIdentifier: pid_t
+        let range: NSRange
+        let rawText: String
+    }
 
     init(
         probeExecutor: SelectedTextProbeExecutor = .shared,
         diagnostics: SelectedTextDiagnostics = .system,
+        replacementEnabled: Bool = false,
         probeObserver: @escaping @Sendable (SelectedTextProbeObservation) -> Void = { _ in }
     ) {
         self.probeExecutor = probeExecutor
         self.diagnostics = diagnostics
+        self.replacementEnabled = replacementEnabled
         self.probeObserver = probeObserver
     }
 
     @MainActor
     func currentSelectionSnapshot(mouseLocation: CGPoint) async -> SelectedTextSnapshot? {
-        let request = SelectedTextProbeRequest.capture(mouseLocation: mouseLocation)
+        guard let request = SelectedTextProbeRequest.capture(mouseLocation: mouseLocation) else { return nil }
         return await currentSelectionSnapshot(request: request)
     }
 
     func currentSelectionSnapshot(request: SelectedTextProbeRequest) async -> SelectedTextSnapshot? {
+        guard await request.hasCurrentScreenConfiguration else { return nil }
         let startedAt = DispatchTime.now().uptimeNanoseconds
         let snapshot: SelectedTextSnapshot?
 
         do {
-            snapshot = try await probeExecutor.execute { [self] cancellation in
+            snapshot = try await probeExecutor.execute(onDiscardedResult: { [self] snapshot in
+                if let contextID = snapshot?.replacementContextID {
+                    replacementContexts.removeValue(forKey: contextID)
+                }
+            }) { [self] cancellation in
                 axSelectionSnapshot(
                     request: request,
                     cancellation: cancellation
@@ -82,6 +124,14 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
             }
         } catch {
             snapshot = nil
+        }
+
+        guard !Task.isCancelled, await request.hasCurrentScreenConfiguration else {
+            if let contextID = snapshot?.replacementContextID {
+                // Cleanup must finish even when the caller was cancelled by a display change.
+                await Task { [self] in await releaseReplacementContext(contextID) }.value
+            }
+            return nil
         }
 
         let endedAt = DispatchTime.now().uptimeNanoseconds
@@ -131,9 +181,11 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
         let snapshot = SelectedTextProbePolicy.snapshot(
             candidates: candidates,
             sourceAppIdentifier: request.sourceAppIdentifier,
+            sourceProcessIdentifier: request.frontmostApplicationProcessIdentifier,
             normalizeBounds: request.normalizedScreenRect,
             diagnostics: diagnostics,
-            isCancelled: { cancellation.isCancelled }
+            isCancelled: { cancellation.isCancelled },
+            allowsReplacementContext: replacementEnabled
         )
         debugLog(
             snapshot.map {
@@ -249,6 +301,7 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
                     candidateIndex += 1
                     return probeCandidate(
                         element: candidateElement,
+                        request: request,
                         context: context
                     )
                 }
@@ -260,11 +313,20 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
 
     private func probeCandidate(
         element: AXUIElement,
+        request: SelectedTextProbeRequest,
         context: String
     ) -> SelectedTextProbeCandidate {
         SelectedTextProbeCandidate(
             context: context,
             debugSummary: { [self] in debugSummary(of: element) },
+            commitSelectionContext: { [self] range, rawText, _ in
+                replacementContextID(
+                    for: element,
+                    range: range,
+                    rawText: rawText,
+                    request: request
+                )
+            },
             selectedText: { [self] in
                 selectedText(from: element, debugContext: context)
             },
@@ -327,6 +389,248 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
                 )
             }
         )
+    }
+
+    private func replacementContextID(
+        for element: AXUIElement,
+        range: NSRange,
+        rawText: String,
+        request: SelectedTextProbeRequest
+    ) -> UUID? {
+        guard replacementEnabled else { return nil }
+        guard let processIdentifier = request.frontmostApplicationProcessIdentifier else {
+            debugLog("replacement capture rejected reason=missingSourceProcess")
+            return nil
+        }
+
+        let application = AXUIElementCreateApplication(processIdentifier)
+        configureMessagingTimeout(for: application, timeout: 0.1)
+        var elementProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(element, &elementProcessIdentifier) == .success,
+              elementProcessIdentifier == processIdentifier else {
+            debugLog("replacement capture rejected reason=sourceProcessMismatch")
+            return nil
+        }
+        guard let window = window(of: element),
+              let focusedWindow = focusedWindow(from: application),
+              CFEqual(window, focusedWindow) else {
+            debugLog("replacement capture rejected reason=windowMismatch")
+            return nil
+        }
+        guard let focusedElement = focusedElement(from: application, source: nil) else {
+            debugLog("replacement capture rejected reason=focusMismatch")
+            return nil
+        }
+
+        let isSameElement = CFEqual(element, focusedElement)
+        let relationship: SelectedTextReplacementPolicy.CandidateRelationship
+        if isSameElement {
+            relationship = .sameElement
+        } else if isAncestor(focusedElement, of: element) {
+            relationship = .insideFocusedElement
+        } else if isAncestor(element, of: focusedElement) {
+            relationship = .containsFocusedElement
+        } else {
+            relationship = .unrelated
+        }
+        var focusedProcessIdentifier: pid_t = 0
+        guard AXUIElementGetPid(focusedElement, &focusedProcessIdentifier) == .success,
+              focusedProcessIdentifier == processIdentifier,
+              let focusedElementWindow = self.window(of: focusedElement),
+              CFEqual(window, focusedElementWindow),
+              SelectedTextReplacementPolicy.canBindCandidate(
+                relationship: relationship
+              ) else {
+            debugLog("replacement capture rejected reason=focusMismatch")
+            return nil
+        }
+
+        let targetElement = focusedElement
+        guard let selection = selectedRange(from: targetElement) else {
+            debugLog("replacement capture rejected reason=missingFocusedSelectionRange")
+            return nil
+        }
+        let expectedRange = isSameElement && range.location != NSNotFound ? range : selection.range
+        let rangeText = string(for: selection.axValue, in: targetElement)
+        guard SelectedTextReplacementPolicy.selectionTextMatches(
+            rawText: rawText,
+            rangeText: rangeText,
+            selectedText: selectedText(from: targetElement),
+            currentRange: selection.range,
+            expectedRange: expectedRange
+        ) else {
+            debugLog("replacement capture rejected reason=selectionMismatch rangeTextAvailable=\(rangeText != nil)")
+            return nil
+        }
+
+        let isSecure = isSecureTextElement(targetElement)
+        guard SelectedTextReplacementPolicy.canCaptureSelection(
+            supportsChannel: replacementEnabled,
+            isFrontmostApplication: true,
+            isFocusedElement: true,
+            isSameWindow: true,
+            isSecure: isSecure,
+            range: selection.range,
+            rawText: rawText
+        ) else {
+            debugLog("replacement capture rejected reason=invalidSelection secure=\(isSecure)")
+            return nil
+        }
+
+        let contextID = UUID()
+        replacementContexts[contextID] = ReplacementContext(
+            application: application,
+            window: window,
+            element: targetElement,
+            processIdentifier: processIdentifier,
+            range: selection.range,
+            rawText: rawText
+        )
+        if replacementContexts.count > 8,
+           let oldestID = replacementContexts.keys.first(where: { $0 != contextID }) {
+            replacementContexts.removeValue(forKey: oldestID)
+        }
+        debugLog("replacement selection captured rangeTextAvailable=\(rangeText != nil)")
+        return contextID
+    }
+
+    func releaseReplacementContext(_ contextID: UUID?) async {
+        guard let contextID else { return }
+        _ = try? await probeExecutor.execute { [self] _ in
+            replacementContexts.removeValue(forKey: contextID)
+            return true
+        }
+    }
+
+    func releaseAllReplacementContexts() async {
+        _ = try? await probeExecutor.execute { [self] _ in
+            replacementContexts.removeAll(keepingCapacity: false)
+            return true
+        }
+    }
+
+    func validateReplacementTarget(
+        contextID: UUID,
+        frontmostProcessIdentifier: pid_t?
+    ) async throws {
+        try await probeExecutor.execute { [self] _ in
+            guard let context = replacementContexts[contextID] else {
+                throw SelectedTextReplacementFailure.targetUnavailable
+            }
+            guard frontmostProcessIdentifier == context.processIdentifier else {
+                throw SelectedTextReplacementFailure.sourceChanged
+            }
+            guard let focusedWindow = focusedWindow(from: context.application),
+                  let focusedElement = focusedElement(from: context.application, source: nil) else {
+                throw SelectedTextReplacementFailure.targetUnavailable
+            }
+            let selection = selectedRange(from: context.element)
+            let rangeText = selection.flatMap { string(for: $0.axValue, in: context.element) }
+            guard SelectedTextReplacementPolicy.targetStillMatches(
+                expectedProcessIdentifier: context.processIdentifier,
+                currentProcessIdentifier: frontmostProcessIdentifier,
+                isSameWindow: CFEqual(focusedWindow, context.window),
+                isSameFocusedElement: CFEqual(focusedElement, context.element),
+                currentRange: selection?.range,
+                expectedRange: context.range,
+                currentRawText: rangeText ?? selectedText(from: context.element),
+                expectedRawText: context.rawText
+            ), SelectedTextReplacementPolicy.selectionTextMatches(
+                rawText: context.rawText,
+                rangeText: rangeText,
+                selectedText: selectedText(from: context.element),
+                currentRange: selection?.range,
+                expectedRange: context.range
+            ) else {
+                throw SelectedTextReplacementFailure.selectionChanged
+            }
+            guard SelectedTextReplacementPolicy.isEditableTarget(
+                enabled: enabledState(of: context.element),
+                isSecure: isSecureTextElement(context.element),
+                selectedTextIsSettable: isAttributeSettable(kAXSelectedTextAttribute as CFString, on: context.element),
+                valueIsSettable: isAttributeSettable(kAXValueAttribute as CFString, on: context.element)
+            ) else {
+                throw SelectedTextReplacementFailure.targetNotEditable
+            }
+        }
+    }
+
+    func replacementTargetMatches(
+        contextID: UUID,
+        frontmostProcessIdentifier: pid_t?
+    ) async -> Bool {
+        do {
+            try await validateReplacementTarget(contextID: contextID, frontmostProcessIdentifier: frontmostProcessIdentifier)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    func replacementTextMatches(contextID: UUID, text: String) async -> Bool {
+        (try? await probeExecutor.execute { [self] _ in
+            guard let context = replacementContexts[contextID],
+                  let window = focusedWindow(from: context.application),
+                  CFEqual(window, context.window),
+                  let element = focusedElement(from: context.application, source: nil),
+                  CFEqual(element, context.element),
+                  text.utf16.count <= Int.max - context.range.location else {
+                return false
+            }
+
+            var cfRange = CFRange(
+                location: context.range.location,
+                length: text.utf16.count
+            )
+            guard let value = AXValueCreate(.cfRange, &cfRange) else { return false }
+            return string(for: value, in: context.element) == text
+        }) ?? false
+    }
+
+    private func window(of element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            element,
+            kAXWindowAttribute as CFString,
+            &value
+        )
+        guard result == .success, let value,
+              CFGetTypeID(value) == AXUIElementGetTypeID() else {
+            return nil
+        }
+        return unsafeBitCast(value, to: AXUIElement.self)
+    }
+
+    private func isAncestor(_ ancestor: AXUIElement, of element: AXUIElement) -> Bool {
+        var current = parent(of: element)
+        for _ in 0..<8 {
+            guard let candidate = current else { return false }
+            if CFEqual(candidate, ancestor) { return true }
+            current = parent(of: candidate)
+        }
+        return false
+    }
+
+    private func enabledState(of element: AXUIElement) -> Bool? {
+        var value: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            element,
+            kAXEnabledAttribute as CFString,
+            &value
+        )
+        if result == .attributeUnsupported || result == .noValue { return nil }
+        guard result == .success, let enabled = value as? Bool else { return false }
+        return enabled
+    }
+
+    private func isSecureTextElement(_ element: AXUIElement) -> Bool {
+        stringAttribute(kAXSubroleAttribute as CFString, from: element) == kAXSecureTextFieldSubrole as String
+    }
+
+    private func isAttributeSettable(_ attribute: CFString, on element: AXUIElement) -> Bool {
+        var isSettable = DarwinBoolean(false)
+        return AXUIElementIsAttributeSettable(element, attribute, &isSettable) == .success
+            && isSettable.boolValue
     }
 
     private func focusedElement(from systemWideElement: AXUIElement) -> AXUIElement? {
@@ -695,13 +999,27 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
 
     @MainActor
     private func clipboardSelectionSnapshot() async -> SelectedTextSnapshot? {
+        guard ClipboardSelectionOperationGate.acquire() else {
+            debugLog("clipboard fallback: another clipboard operation is active")
+            return nil
+        }
+        defer { ClipboardSelectionOperationGate.release() }
+
         let pasteboard = NSPasteboard.general
 
         // Save current clipboard state
         let originalChangeCount = pasteboard.changeCount
         let originalItems = savePasteboardItems(from: pasteboard)
+        var ownedChangeCount = originalChangeCount
+        var shouldRestorePasteboard = false
         defer {
-            restorePasteboard(items: originalItems, to: pasteboard)
+            if shouldRestorePasteboard,
+               SelectedTextReplacementPolicy.shouldRestorePasteboard(
+                currentChangeCount: pasteboard.changeCount,
+                ownedChangeCount: ownedChangeCount
+            ) {
+                restorePasteboard(items: originalItems, to: pasteboard)
+            }
         }
 
         // Simulate Cmd+C
@@ -713,7 +1031,11 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
                 debugLog("clipboard fallback: cancelled")
                 return nil
             }
-            if pasteboard.changeCount != originalChangeCount { break }
+            if pasteboard.changeCount != originalChangeCount {
+                ownedChangeCount = pasteboard.changeCount
+                shouldRestorePasteboard = true
+                break
+            }
             do {
                 try await Task.sleep(nanoseconds: 10_000_000) // 10ms
             } catch {
@@ -746,7 +1068,9 @@ nonisolated final class SelectedTextService: @unchecked Sendable {
             selectedRange: NSRange(location: NSNotFound, length: normalizedText.utf16.count),
             bounds: nil,
             sourceAppIdentifier: frontmostApp?.bundleIdentifier,
-            source: .clipboard
+            source: .clipboard,
+            rawText: text,
+            sourceProcessIdentifier: frontmostApp?.processIdentifier
         )
 
         return snapshot

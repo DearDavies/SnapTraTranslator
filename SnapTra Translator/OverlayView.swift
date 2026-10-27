@@ -375,6 +375,9 @@ struct OverlayView: View {
                                     }
 
                                     CopyButton(text: translatedText)
+                                    if model.showsSelectedTextReplacement(using: .native) {
+                                        replaceSelectedTextButton(using: .native)
+                                    }
                                 }
 
                                 paragraphTextContent(
@@ -406,6 +409,15 @@ struct OverlayView: View {
 
                             paragraphServiceResultCard(result: result, fontSize: translationFontSize)
                         }
+                    }
+
+                    if let feedback = model.selectedTextReplacementFeedback {
+                        Text(feedback)
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, paragraphTextHorizontalPadding)
+                            .padding(.vertical, 8)
                     }
                 }
             }
@@ -647,7 +659,32 @@ struct OverlayView: View {
                 CopyButton(text: copyText)
                     .layoutPriority(1)
             }
+            if let copyText,
+               !copyText.isEmpty,
+               model.showsSelectedTextReplacement(using: result.sourceType) {
+                replaceSelectedTextButton(using: result.sourceType)
+            }
         }
+    }
+
+    private func replaceSelectedTextButton(using sourceType: SentenceTranslationSource.SourceType) -> some View {
+        Button {
+            model.replaceSelectedText(using: sourceType)
+        } label: {
+            if model.selectedTextReplacementOperationID != nil {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 18, height: 18)
+            } else {
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.system(size: 10, weight: .semibold))
+                    .frame(width: 18, height: 18)
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(model.selectedTextReplacementOperationID != nil || model.isSelectedTextReplacementConsumed)
+        .help(L("Replace Original"))
+        .accessibilityLabel(L("Replace Original"))
     }
 
     private static func formatTranslationDuration(_ duration: TimeInterval) -> String {
@@ -867,7 +904,10 @@ struct OverlayView: View {
         paragraphOverlayControlButton(
             systemImage: isExpanded ? "eye.slash" : "pencil",
             helpText: isExpanded ? L("Hide Original Text") : L("Edit Original Text"),
-            action: { isParagraphOriginalEditorExpanded.toggle() }
+            action: {
+                model.invalidateSelectedTextReplacement()
+                isParagraphOriginalEditorExpanded.toggle()
+            }
         )
     }
 

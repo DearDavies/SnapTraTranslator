@@ -25,7 +25,9 @@ final class SinglePressLookupRequestTests: XCTestCase {
             mouseLocation: CGPoint(x: 120, y: 240),
             frontmostApplicationProcessIdentifier: 42,
             sourceAppIdentifier: "com.example.source",
-            globalScreenMaxY: 1_080
+            screenConfiguration: SelectedTextScreenConfiguration(
+                primaryDisplay: .init(id: 1, frame: CGRect(x: 0, y: 0, width: 1_920, height: 1_080), scale: 2)
+            )
         )
         let request = SinglePressLookupRequest(
             lookupID: UUID(),
@@ -38,6 +40,72 @@ final class SinglePressLookupRequestTests: XCTestCase {
         )
 
         XCTAssertEqual(request.selectedTextProbeRequest, probeRequest)
+    }
+
+    func testPrimaryScreenDefinesCoordinatesWithExternalScreensInEveryDirection() {
+        let primary = SelectedTextScreenConfiguration.Display(
+            id: 1, frame: CGRect(x: 0, y: 0, width: 1_496, height: 967), scale: 2
+        )
+        for externalFrame in [
+            CGRect(x: 1_496, y: -50, width: 1_920, height: 1_080),
+            CGRect(x: -1_920, y: 0, width: 1_920, height: 1_080),
+            CGRect(x: 0, y: 967, width: 1_920, height: 1_080),
+            CGRect(x: 0, y: -1_080, width: 1_920, height: 1_080),
+        ] {
+            let configuration = SelectedTextScreenConfiguration(
+                primaryDisplay: primary,
+                otherDisplays: [.init(id: 2, frame: externalFrame, scale: 1)]
+            )
+            XCTAssertEqual(configuration.accessibilityPoint(from: CGPoint(x: 425, y: 25)), CGPoint(x: 425, y: 942))
+            XCTAssertEqual(
+                configuration.appKitRect(from: CGRect(x: 409, y: 933, width: 33, height: 18)),
+                CGRect(x: 409, y: 16, width: 33, height: 18)
+            )
+            let externalPoint = CGPoint(x: externalFrame.midX, y: externalFrame.midY)
+            let axPoint = configuration.accessibilityPoint(from: externalPoint)
+            XCTAssertEqual(axPoint.x, externalPoint.x)
+            XCTAssertEqual(axPoint.y, 967 - externalPoint.y)
+        }
+    }
+
+    func testConfigurationChangesInvalidateLayoutButDoNotRescaleAXPoints() {
+        let primary = SelectedTextScreenConfiguration.Display(
+            id: 1, frame: CGRect(x: 0, y: 0, width: 1_496, height: 967), scale: 2
+        )
+        let external = SelectedTextScreenConfiguration.Display(
+            id: 2, frame: CGRect(x: 1_496, y: -50, width: 1_920, height: 1_080), scale: 1
+        )
+        let original = SelectedTextScreenConfiguration(primaryDisplay: primary, otherDisplays: [external])
+        let point = CGPoint(x: 2_000, y: 400)
+        let request = SelectedTextProbeRequest(
+            mouseLocation: point,
+            frontmostApplicationProcessIdentifier: 42,
+            sourceAppIdentifier: "test.app",
+            screenConfiguration: original
+        )
+        let scaled = SelectedTextScreenConfiguration(
+            primaryDisplay: primary,
+            otherDisplays: [.init(id: 2, frame: external.frame, scale: 2)]
+        )
+        let disconnected = SelectedTextScreenConfiguration(primaryDisplay: primary)
+        let newPrimary = SelectedTextScreenConfiguration(
+            primaryDisplay: .init(id: 2, frame: CGRect(x: 0, y: 0, width: 1_920, height: 1_080), scale: 1)
+        )
+        let rotated = SelectedTextScreenConfiguration(
+            primaryDisplay: primary,
+            otherDisplays: [.init(id: 2, frame: external.frame, scale: external.scale, rotation: 180)]
+        )
+        let reconnected = SelectedTextScreenConfiguration(primaryDisplay: primary, otherDisplays: [external], revision: 1)
+
+        XCTAssertNotEqual(original, scaled)
+        XCTAssertNotEqual(original, disconnected)
+        XCTAssertNotEqual(original, newPrimary)
+        XCTAssertNotEqual(original, rotated)
+        XCTAssertNotEqual(original, reconnected)
+        XCTAssertEqual(original.accessibilityPoint(from: point), scaled.accessibilityPoint(from: point))
+        XCTAssertEqual(request.accessibilityPoint, CGPoint(x: 2_000, y: 567))
+        XCTAssertEqual(request.screenConfiguration, original)
+        XCTAssertEqual(newPrimary.accessibilityPoint(from: point), CGPoint(x: 2_000, y: 680))
     }
 
     func testUnsupportedChannelUsesOCROnlyPolicy() {
@@ -328,6 +396,37 @@ final class SelectedTextProbePolicyTests: XCTestCase {
 }
 
 final class SelectedTextProbeExecutorTests: XCTestCase {
+    func testCancellationAfterAXResultCleansUpDiscardedContext() async {
+        let executor = SelectedTextProbeExecutor(label: #function)
+        let didCapture = expectation(description: "context captured")
+        let didDiscard = expectation(description: "discarded context released")
+        let mayReturn = DispatchSemaphore(value: 0)
+        let contextID = UUID()
+        let task = Task {
+            try await executor.execute(onDiscardedResult: { result in
+                XCTAssertEqual(result, contextID)
+                didDiscard.fulfill()
+            }) { _ in
+                didCapture.fulfill()
+                mayReturn.wait()
+                return contextID
+            }
+        }
+
+        await fulfillment(of: [didCapture], timeout: 1)
+        task.cancel()
+        mayReturn.signal()
+        do {
+            _ = try await task.value
+            XCTFail("cancelled probe must not return its context")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        await fulfillment(of: [didDiscard], timeout: 1)
+    }
+
     func testConcurrentProbesRunWithMaximumConcurrencyOfOne() async throws {
         let executor = SelectedTextProbeExecutor(label: #function)
         let concurrency = ProbeConcurrencyRecorder()
@@ -419,6 +518,54 @@ final class SelectedTextProbeExecutorTests: XCTestCase {
 
 @MainActor
 final class SinglePressLookupCoordinatorTests: XCTestCase {
+    func testScreenChangeDuringAXRejectsSelectionWithoutClipboardOrOCRFallback() async {
+        var isCurrent = true
+        var fallbackCount = 0
+        var publishedRoutes: [SinglePressLookupResolvedRoute] = []
+        let snapshot = accessibilitySnapshot(text: "Original selection")
+        let decision: SinglePressLookupDecision<String> = await SinglePressLookupCoordinator.resolve(
+            request: makeRequest(),
+            accessibilityProbe: { _ in
+                isCurrent = false
+                return SinglePressLookupResolution(intent: .selectedTextSentence(snapshot), shouldTryClipboardFallback: true)
+            },
+            clipboardProbe: { _ in
+                fallbackCount += 1
+                return nil
+            },
+            loadOCRCandidate: { _ in
+                fallbackCount += 1
+                return "stale OCR"
+            },
+            routeResolved: { publishedRoutes.append($0) },
+            isRequestCurrent: { isCurrent }
+        )
+
+        guard case .cancelled = decision else { return XCTFail("stale screen configuration must discard AX") }
+        XCTAssertEqual(fallbackCount, 0)
+        XCTAssertTrue(publishedRoutes.isEmpty)
+    }
+
+    func testScreenChangeDuringClipboardCannotPublishSelectionOrOCR() async {
+        var isCurrent = true
+        var publishedRoutes: [SinglePressLookupResolvedRoute] = []
+        let snapshot = clipboardSnapshot(text: "Copied selection")
+        let decision: SinglePressLookupDecision<String> = await SinglePressLookupCoordinator.resolve(
+            request: makeRequest(),
+            accessibilityProbe: { _ in self.uncertainAccessibilityResolution() },
+            clipboardProbe: { _ in
+                isCurrent = false
+                return snapshot
+            },
+            loadOCRCandidate: { _ in "stale OCR" },
+            routeResolved: { publishedRoutes.append($0) },
+            isRequestCurrent: { isCurrent }
+        )
+
+        guard case .cancelled = decision else { return XCTFail("stale screen configuration must discard fallback") }
+        XCTAssertTrue(publishedRoutes.isEmpty)
+    }
+
     func testKnownAXSelectionDoesNotStartOCRCandidate() async {
         let request = makeRequest()
         let dependencies = CoordinatorDependencyRecorder()

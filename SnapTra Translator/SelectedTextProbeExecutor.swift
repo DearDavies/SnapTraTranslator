@@ -1,40 +1,117 @@
 import AppKit
+import CoreGraphics
 import Dispatch
 import Foundation
 
-nonisolated struct SelectedTextProbeRequest: Equatable, Sendable {
-    let mouseLocation: CGPoint
-    let frontmostApplicationProcessIdentifier: pid_t?
-    let sourceAppIdentifier: String?
-    let globalScreenMaxY: CGFloat?
+nonisolated struct SelectedTextScreenConfiguration: Equatable, Sendable {
+    struct Display: Equatable, Sendable {
+        let id: CGDirectDisplayID
+        let frame: CGRect
+        let scale: CGFloat
+        let rotation: Double
+
+        init(id: CGDirectDisplayID, frame: CGRect, scale: CGFloat, rotation: Double = 0) {
+            self.id = id
+            self.frame = frame
+            self.scale = scale
+            self.rotation = rotation
+        }
+    }
+
+    @MainActor private static var currentRevision: UInt64 = 0
+
+    let primaryDisplay: Display
+    let otherDisplays: [Display]
+    let revision: UInt64
+
+    init(primaryDisplay: Display, otherDisplays: [Display] = [], revision: UInt64 = 0) {
+        self.primaryDisplay = primaryDisplay
+        self.otherDisplays = otherDisplays.sorted { $0.id < $1.id }
+        self.revision = revision
+    }
 
     @MainActor
-    static func capture(mouseLocation: CGPoint) -> SelectedTextProbeRequest {
+    static func invalidate() {
+        currentRevision &+= 1
+    }
+
+    @MainActor
+    static func capture() -> SelectedTextScreenConfiguration? {
+        var displays: [Display] = []
+        for screen in NSScreen.screens {
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber else {
+                return nil
+            }
+            let displayID = number.uint32Value
+            displays.append(Display(
+                id: displayID,
+                frame: screen.frame,
+                scale: screen.backingScaleFactor,
+                rotation: CGDisplayRotation(displayID)
+            ))
+        }
+        // AppKit's first screen defines the global origin; NSScreen.main follows keyboard focus.
+        guard let primaryDisplay = displays.first else { return nil }
+        return SelectedTextScreenConfiguration(
+            primaryDisplay: primaryDisplay,
+            otherDisplays: Array(displays.dropFirst()),
+            revision: currentRevision
+        )
+    }
+
+    func accessibilityPoint(from point: CGPoint) -> CGPoint {
+        CGPoint(x: point.x, y: primaryDisplay.frame.maxY - point.y)
+    }
+
+    func appKitRect(from rect: CGRect) -> CGRect {
+        CGRect(
+            x: rect.minX,
+            y: primaryDisplay.frame.maxY - rect.maxY,
+            width: rect.width,
+            height: rect.height
+        )
+    }
+}
+
+nonisolated struct SelectedTextProbeRequest: Equatable, Sendable {
+    let mouseLocation: CGPoint
+    let accessibilityPoint: CGPoint
+    let frontmostApplicationProcessIdentifier: pid_t?
+    let sourceAppIdentifier: String?
+    let screenConfiguration: SelectedTextScreenConfiguration
+
+    init(
+        mouseLocation: CGPoint,
+        frontmostApplicationProcessIdentifier: pid_t?,
+        sourceAppIdentifier: String?,
+        screenConfiguration: SelectedTextScreenConfiguration
+    ) {
+        self.mouseLocation = mouseLocation
+        self.accessibilityPoint = screenConfiguration.accessibilityPoint(from: mouseLocation)
+        self.frontmostApplicationProcessIdentifier = frontmostApplicationProcessIdentifier
+        self.sourceAppIdentifier = sourceAppIdentifier
+        self.screenConfiguration = screenConfiguration
+    }
+
+    @MainActor
+    static func capture(mouseLocation: CGPoint) -> SelectedTextProbeRequest? {
+        guard let screenConfiguration = SelectedTextScreenConfiguration.capture() else { return nil }
         let frontmostApplication = NSWorkspace.shared.frontmostApplication
         return SelectedTextProbeRequest(
             mouseLocation: mouseLocation,
             frontmostApplicationProcessIdentifier: frontmostApplication?.processIdentifier,
             sourceAppIdentifier: frontmostApplication?.bundleIdentifier,
-            globalScreenMaxY: NSScreen.screens.map(\.frame.maxY).max()
+            screenConfiguration: screenConfiguration
         )
     }
 
-    var accessibilityPoint: CGPoint {
-        guard let globalScreenMaxY else { return mouseLocation }
-        return CGPoint(
-            x: mouseLocation.x,
-            y: globalScreenMaxY - mouseLocation.y
-        )
+    @MainActor
+    var hasCurrentScreenConfiguration: Bool {
+        screenConfiguration == SelectedTextScreenConfiguration.capture()
     }
 
     func normalizedScreenRect(_ rect: CGRect) -> CGRect {
-        guard let globalScreenMaxY else { return rect }
-        return CGRect(
-            x: rect.minX,
-            y: globalScreenMaxY - rect.maxY,
-            width: rect.width,
-            height: rect.height
-        )
+        screenConfiguration.appKitRect(from: rect)
     }
 }
 
@@ -72,6 +149,7 @@ nonisolated final class SelectedTextProbeExecutor: @unchecked Sendable {
     }
 
     func execute<Result: Sendable>(
+        onDiscardedResult: @escaping @Sendable (Result) -> Void = { _ in },
         _ operation: @escaping @Sendable (SelectedTextProbeCancellation) throws -> Result
     ) async throws -> Result {
         let cancellation = SelectedTextProbeCancellation()
@@ -83,7 +161,12 @@ nonisolated final class SelectedTextProbeExecutor: @unchecked Sendable {
                     do {
                         try cancellation.checkCancellation()
                         let result = try operation(cancellation)
-                        try cancellation.checkCancellation()
+                        do {
+                            try cancellation.checkCancellation()
+                        } catch {
+                            onDiscardedResult(result)
+                            throw error
+                        }
                         continuation.resume(returning: result)
                     } catch {
                         continuation.resume(throwing: error)
@@ -162,18 +245,37 @@ nonisolated struct SelectedTextProbeMarkerRange {
 nonisolated struct SelectedTextProbeCandidate {
     let context: String
     let debugSummary: () -> String
+    let commitSelectionContext: (NSRange, String, SelectedTextProbeRange?) -> UUID?
     let selectedText: () -> String?
     let selectedRange: () -> SelectedTextProbeRange?
     let selectedTextMarkerRange: () -> SelectedTextProbeMarkerRange?
+
+    init(
+        context: String,
+        debugSummary: @escaping () -> String,
+        commitSelectionContext: @escaping (NSRange, String, SelectedTextProbeRange?) -> UUID? = { _, _, _ in nil },
+        selectedText: @escaping () -> String?,
+        selectedRange: @escaping () -> SelectedTextProbeRange?,
+        selectedTextMarkerRange: @escaping () -> SelectedTextProbeMarkerRange?
+    ) {
+        self.context = context
+        self.debugSummary = debugSummary
+        self.commitSelectionContext = commitSelectionContext
+        self.selectedText = selectedText
+        self.selectedRange = selectedRange
+        self.selectedTextMarkerRange = selectedTextMarkerRange
+    }
 }
 
 nonisolated enum SelectedTextProbePolicy {
     static func snapshot(
         candidates: AnySequence<SelectedTextProbeCandidate>,
         sourceAppIdentifier: String?,
+        sourceProcessIdentifier: pid_t? = nil,
         normalizeBounds: (CGRect) -> CGRect,
         diagnostics: SelectedTextDiagnostics = .system,
-        isCancelled: () -> Bool = { false }
+        isCancelled: () -> Bool = { false },
+        allowsReplacementContext: Bool = true
     ) -> SelectedTextSnapshot? {
         for candidate in candidates {
             guard !isCancelled() else { return nil }
@@ -181,7 +283,8 @@ nonisolated enum SelectedTextProbePolicy {
             diagnostics.log("\(candidate.context) \(candidate.debugSummary())")
 
             guard !isCancelled() else { return nil }
-            let directText = normalized(candidate.selectedText())
+            let directRawText = candidate.selectedText()
+            let directText = normalized(directRawText)
 
             guard !isCancelled() else { return nil }
             let range = candidate.selectedRange()
@@ -193,24 +296,39 @@ nonisolated enum SelectedTextProbePolicy {
             let hasKnownRange = isKnown(selectedRange)
 
             if let directText, hasKnownRange {
+                let rawText = directRawText ?? directText
                 return makeSnapshot(
                     text: directText,
+                    rawText: rawText,
                     selectedRange: selectedRange,
                     bounds: nil,
-                    sourceAppIdentifier: sourceAppIdentifier
+                    sourceAppIdentifier: sourceAppIdentifier,
+                    sourceProcessIdentifier: sourceProcessIdentifier,
+                    replacementContextID: allowsReplacementContext
+                        ? candidate.commitSelectionContext(selectedRange, rawText, range)
+                        : nil
                 )
             }
 
             var resolvedText = directText
+            var resolvedRawText = directRawText
             if resolvedText == nil, let range {
                 guard !isCancelled() else { return nil }
-                resolvedText = normalized(range.string())
+                let rangeRawText = range.string()
+                resolvedRawText = rangeRawText
+                resolvedText = normalized(rangeRawText)
                 if let resolvedText, hasKnownRange {
+                    let rawText = rangeRawText ?? resolvedText
                     return makeSnapshot(
                         text: resolvedText,
+                        rawText: rawText,
                         selectedRange: selectedRange,
                         bounds: nil,
-                        sourceAppIdentifier: sourceAppIdentifier
+                        sourceAppIdentifier: sourceAppIdentifier,
+                        sourceProcessIdentifier: sourceProcessIdentifier,
+                        replacementContextID: allowsReplacementContext
+                            ? candidate.commitSelectionContext(selectedRange, rawText, range)
+                            : nil
                     )
                 }
             }
@@ -220,11 +338,13 @@ nonisolated enum SelectedTextProbePolicy {
 
             if resolvedText == nil, let markerRange {
                 guard !isCancelled() else { return nil }
-                resolvedText = normalized(markerRange.string())
+                resolvedRawText = markerRange.string()
+                resolvedText = normalized(resolvedRawText)
 
                 if resolvedText == nil {
                     guard !isCancelled() else { return nil }
-                    resolvedText = normalized(markerRange.attributedString()?.string)
+                    resolvedRawText = markerRange.attributedString()?.string
+                    resolvedText = normalized(resolvedRawText)
                 }
             }
 
@@ -252,8 +372,11 @@ nonisolated enum SelectedTextProbePolicy {
                 }
             }
 
+            guard !isCancelled() else { return nil }
+            let rawText = resolvedRawText ?? resolvedText
             return makeSnapshot(
                 text: resolvedText,
+                rawText: rawText,
                 selectedRange: NSRange(
                     location: selectedRange.location,
                     length: selectedRange.location == NSNotFound
@@ -261,7 +384,11 @@ nonisolated enum SelectedTextProbePolicy {
                         : selectedRange.length
                 ),
                 bounds: resolvedBounds,
-                sourceAppIdentifier: sourceAppIdentifier
+                sourceAppIdentifier: sourceAppIdentifier,
+                sourceProcessIdentifier: sourceProcessIdentifier,
+                replacementContextID: allowsReplacementContext
+                    ? candidate.commitSelectionContext(selectedRange, rawText, range)
+                    : nil
             )
         }
 
@@ -290,15 +417,21 @@ nonisolated enum SelectedTextProbePolicy {
 
     private static func makeSnapshot(
         text: String,
+        rawText: String,
         selectedRange: NSRange,
         bounds: CGRect?,
-        sourceAppIdentifier: String?
+        sourceAppIdentifier: String?,
+        sourceProcessIdentifier: pid_t?,
+        replacementContextID: UUID? = nil
     ) -> SelectedTextSnapshot {
         SelectedTextSnapshot(
             text: text,
             selectedRange: selectedRange,
             bounds: bounds,
-            sourceAppIdentifier: sourceAppIdentifier
+            sourceAppIdentifier: sourceAppIdentifier,
+            rawText: rawText,
+            sourceProcessIdentifier: sourceProcessIdentifier,
+            replacementContextID: replacementContextID
         )
     }
 }

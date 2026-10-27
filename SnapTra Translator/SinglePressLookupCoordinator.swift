@@ -75,20 +75,21 @@ nonisolated enum SinglePressLookupCoordinator {
         ) async -> Candidate,
         routeResolved: @escaping @MainActor @Sendable (
             SinglePressLookupResolvedRoute
-        ) -> Void
+        ) -> Void,
+        isRequestCurrent: @escaping @MainActor @Sendable () -> Bool = { true }
     ) async -> SinglePressLookupDecision<Candidate> {
-        guard !Task.isCancelled else { return .cancelled }
+        guard !Task.isCancelled, isRequestCurrent() else { return .cancelled }
 
         switch request.executionPolicy {
         case .ocrOnly:
             routeResolved(.ocr)
             let candidate = await loadOCRCandidate(request)
-            guard !Task.isCancelled else { return .cancelled }
+            guard !Task.isCancelled, isRequestCurrent() else { return .cancelled }
             return .ocr(candidate)
 
         case .selectionFirst(let allowsClipboardFallback):
             let accessibilityResolution = await accessibilityProbe(request)
-            guard !Task.isCancelled else { return .cancelled }
+            guard !Task.isCancelled, isRequestCurrent() else { return .cancelled }
 
             if case .selectedTextSentence(let snapshot) = accessibilityResolution.intent {
                 routeResolved(.selectedText(snapshot.source))
@@ -99,7 +100,7 @@ nonisolated enum SinglePressLookupCoordinator {
                   accessibilityResolution.shouldTryClipboardFallback else {
                 routeResolved(.ocr)
                 let candidate = await loadOCRCandidate(request)
-                guard !Task.isCancelled else { return .cancelled }
+                guard !Task.isCancelled, isRequestCurrent() else { return .cancelled }
                 return .ocr(candidate)
             }
 
@@ -116,7 +117,7 @@ nonisolated enum SinglePressLookupCoordinator {
 
             return await withTaskCancellationHandler {
                 let clipboardSnapshot = await clipboardTask.value
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled, isRequestCurrent() else {
                     ocrTask.cancel()
                     return .cancelled
                 }
@@ -136,7 +137,7 @@ nonisolated enum SinglePressLookupCoordinator {
 
                 routeResolved(.ocr)
                 let candidate = await ocrTask.value
-                guard !Task.isCancelled else { return .cancelled }
+                guard !Task.isCancelled, isRequestCurrent() else { return .cancelled }
                 return .ocr(candidate)
             } onCancel: {
                 clipboardTask.cancel()
