@@ -143,7 +143,26 @@ cmd_notarize() {
     # Staple notarization ticket
     echo "==> Stapling notarization ticket to DMG"
     xcrun stapler staple "$DMG_PATH"
-    xcrun stapler validate "$DMG_PATH"
+
+    local validation_attempt=1
+    local max_validation_attempts=5
+    local validation_output
+    while [ "$validation_attempt" -le "$max_validation_attempts" ]; do
+        if validation_output=$(xcrun stapler validate "$DMG_PATH" 2>&1); then
+            echo "$validation_output"
+            break
+        fi
+
+        echo "$validation_output"
+        if [ "$validation_attempt" -eq "$max_validation_attempts" ]; then
+            echo "ERROR: DMG notarization validation failed after $max_validation_attempts attempts"
+            return 1
+        fi
+
+        validation_attempt=$((validation_attempt + 1))
+        echo "==> DMG validation failed; retrying in 10 seconds (attempt $validation_attempt/$max_validation_attempts)"
+        sleep 10
+    done
 
     echo "==> Notarization complete!"
 }
