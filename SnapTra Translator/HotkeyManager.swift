@@ -133,39 +133,65 @@ final class HotkeyManager {
     var onTapRelease: (() -> Void)?
     var onDoubleTap: (() -> Void)?
     var onPersistentRelease: (() -> Void)?
+    var onModifierFlagsChanged: ((NSEvent.ModifierFlags) -> Void)?
 
     private var globalMonitor: Any?
     private var localMonitor: Any?
     private var activeSingleKey: SingleKey?
     private var isTargetKeyDown = false
     private var pendingRelease: DispatchWorkItem?
+    private var releaseGeneration: UInt64 = 0
+    private var monitorGeneration: UUID?
     private let releaseConfirmationDelay: TimeInterval = 0.15
     private var gestureStateMachine = HotkeyGestureStateMachine()
+    private let scheduleReleaseWorkItem: (DispatchWorkItem, TimeInterval) -> Void
+
+    init(
+        scheduleReleaseWorkItem: @escaping (DispatchWorkItem, TimeInterval) -> Void = { workItem, delay in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        }
+    ) {
+        self.scheduleReleaseWorkItem = scheduleReleaseWorkItem
+    }
 
     func start(singleKey: SingleKey) {
         stop()
         activeSingleKey = singleKey
+        let monitorGeneration = UUID()
+        self.monitorGeneration = monitorGeneration
         Self.logger.debug(
             "Hotkey monitor started key=\(singleKey.rawValue, privacy: .public) keyCode=\(SingleKeyMapping.keyCode(for: singleKey), privacy: .public)"
         )
         globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged]) { [weak self] event in
             DispatchQueue.main.async {
-                self?.handleFlagsChanged(event)
+                guard let self, self.monitorGeneration == monitorGeneration else { return }
+                self.handleFlagsChanged(event)
             }
         }
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged]) { [weak self] event in
             DispatchQueue.main.async {
-                self?.handleFlagsChanged(event)
+                guard let self, self.monitorGeneration == monitorGeneration else { return }
+                self.handleFlagsChanged(event)
             }
             return event
         }
     }
 
     func resetState() {
-        pendingRelease?.cancel()
-        pendingRelease = nil
+        invalidatePendingRelease()
         gestureStateMachine.reset()
         isTargetKeyDown = false
+    }
+
+    /// Transfers the current press to an interaction that waits for its physical release.
+    /// Keep the physical key state so the pending release is not mistaken for a new gesture.
+    func consumeCurrentGesture() {
+        invalidatePendingRelease()
+        gestureStateMachine.reset()
+    }
+
+    func consumeCurrentRelease() {
+        invalidatePendingRelease()
     }
 
     func stop() {
@@ -178,6 +204,7 @@ final class HotkeyManager {
             NSEvent.removeMonitor(localMonitor)
             self.localMonitor = nil
         }
+        monitorGeneration = nil
         activeSingleKey = nil
     }
 
@@ -185,6 +212,8 @@ final class HotkeyManager {
         guard let key = activeSingleKey else {
             return
         }
+        defer { onModifierFlagsChanged?(event.modifierFlags) }
+
         let keyCode = Int64(event.keyCode)
         let expectedKeyCode = Int64(SingleKeyMapping.keyCode(for: key))
 
@@ -216,14 +245,12 @@ final class HotkeyManager {
                 return
             }
 
-            pendingRelease?.cancel()
-            pendingRelease = nil
+            invalidatePendingRelease()
             let events = gestureStateMachine.handlePress(now: now)
             emit(events)
         } else {
             guard gestureStateMachine.isSingleKeyDown else { return }
-            pendingRelease?.cancel()
-            pendingRelease = nil
+            invalidatePendingRelease()
 
             let resolution = gestureStateMachine.handleRelease(now: now)
             handleReleaseResolution(resolution)
@@ -279,8 +306,11 @@ final class HotkeyManager {
         consumesTapWindow: Bool = false,
         releaseKind: HotkeyReleaseKind
     ) {
+        releaseGeneration &+= 1
+        let generation = releaseGeneration
         let delayedRelease = DispatchWorkItem { [weak self] in
-            guard let self else { return }
+            guard let self, self.releaseGeneration == generation else { return }
+            self.pendingRelease = nil
             // An ineligible modifier combination must not suppress the
             // pending release of the previous standalone gesture.
             guard !self.gestureStateMachine.isSingleKeyDown else { return }
@@ -303,6 +333,12 @@ final class HotkeyManager {
 
         pendingRelease?.cancel()
         pendingRelease = delayedRelease
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: delayedRelease)
+        scheduleReleaseWorkItem(delayedRelease, delay)
+    }
+
+    private func invalidatePendingRelease() {
+        releaseGeneration &+= 1
+        pendingRelease?.cancel()
+        pendingRelease = nil
     }
 }

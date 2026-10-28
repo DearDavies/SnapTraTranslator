@@ -8,6 +8,25 @@ nonisolated struct SelectedTextReplacementSession: Equatable, Sendable {
     let rawText: String
 }
 
+struct SelectedTextReplacementRequest: Equatable {
+    let operationID: UUID
+    let session: SelectedTextReplacementSession
+    let lookupID: UUID
+    let sourceType: SentenceTranslationSource.SourceType
+    let translatedText: String
+}
+
+enum SelectedTextReplacementPhase: Equatable {
+    case waitingForModifiers
+    case replacing
+    case pasteDispatched
+}
+
+struct SelectedTextReplacementOperation: Equatable {
+    let request: SelectedTextReplacementRequest
+    var phase: SelectedTextReplacementPhase
+}
+
 nonisolated enum SelectedTextReplacementOutcome: Equatable, Sendable {
     case verified
     case pasteDispatched

@@ -19,7 +19,16 @@ final class PasteboardCoordinator {
 
     static let shared = PasteboardCoordinator()
 
+    private let pasteboard: NSPasteboard
     private var activeLeaseID: UUID?
+
+    init(pasteboard: NSPasteboard = .general) {
+        self.pasteboard = pasteboard
+    }
+
+    var changeCount: Int {
+        pasteboard.changeCount
+    }
 
     func acquire() -> Lease? {
         guard activeLeaseID == nil else { return nil }
@@ -35,7 +44,6 @@ final class PasteboardCoordinator {
 
     func capture(using lease: Lease) -> Snapshot? {
         guard owns(lease) else { return nil }
-        let pasteboard = NSPasteboard.general
         var items: [[NSPasteboard.PasteboardType: Data]] = []
         for pasteboardItem in pasteboard.pasteboardItems ?? [] {
             var itemData: [NSPasteboard.PasteboardType: Data] = [:]
@@ -55,7 +63,6 @@ final class PasteboardCoordinator {
         expectedChangeCount: Int
     ) -> WriteResult? {
         guard owns(lease) else { return nil }
-        let pasteboard = NSPasteboard.general
         guard pasteboard.changeCount == expectedChangeCount else { return nil }
         pasteboard.clearContents()
         let succeeded = pasteboard.setString(text, forType: .string)
@@ -69,7 +76,6 @@ final class PasteboardCoordinator {
         ifChangeCount expectedChangeCount: Int
     ) -> Bool {
         guard owns(lease) else { return false }
-        let pasteboard = NSPasteboard.general
         guard SelectedTextReplacementPolicy.shouldRestorePasteboard(
             currentChangeCount: pasteboard.changeCount,
             ownedChangeCount: expectedChangeCount

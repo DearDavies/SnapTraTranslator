@@ -526,10 +526,48 @@ final class AppModel: ObservableObject {
     private var lastAvailabilityKey: String?
     private var cachedLanguageStatuses: [String: CachedLanguageAvailabilityStatus] = [:]
     private var paragraphTranslationTask: Task<Void, Never>?
-    private var selectedTextReplacementTask: Task<Void, Never>?
     @Published private(set) var selectedTextReplacementSession: SelectedTextReplacementSession?
-    @Published private(set) var selectedTextReplacementOperationID: UUID?
     @Published private(set) var selectedTextReplacementFeedback: String?
+    private lazy var selectedTextReplacementCoordinator = SelectedTextReplacementCoordinator(
+        currentModifiers: {
+            NSEvent.modifierFlags
+        },
+        consumeCurrentGesture: { [weak self] in
+            self?.hotkeyManager.consumeCurrentGesture()
+        },
+        consumeCurrentRelease: { [weak self] in
+            self?.hotkeyManager.consumeCurrentRelease()
+        },
+        isRequestCurrent: { [weak self] request in
+            self?.isReplacementRequestCurrent(request) == true
+        },
+        performReplacement: { [weak self] request, didDispatch in
+            guard let self else { throw CancellationError() }
+            return try await selectedTextReplacementService.replace(
+                session: request.session,
+                translatedText: request.translatedText,
+                allowsHeldModifiers: true,
+                hideOverlay: { [weak self] in
+                    self?.overlayWindowController.hideWindowOnly()
+                },
+                onPasteDispatched: didDispatch
+            )
+        },
+        onPasteDispatched: { [weak self] request in
+            self?.consumedReplacementSessionIDs.insert(request.session.id)
+        },
+        onCompletion: { [weak self] request, result in
+            self?.finishSelectedTextReplacement(request, result: result)
+        },
+        onDiscardedCompletion: { [weak self] request in
+            guard let self,
+                  self.selectedTextReplacementSession?.contextID != request.session.contextID else { return }
+            Task {
+                await self.selectedTextService.releaseReplacementContext(request.session.contextID)
+            }
+        }
+    )
+    private var selectedTextReplacementOperationCancellable: AnyCancellable?
     private var consumedReplacementSessionIDs = Set<UUID>()
     private var activeInPlaceTranslationContent: InPlaceTranslationContent?
     private var activeInPlaceImageTranslationContent: InPlaceImageTranslationContent?
@@ -568,6 +606,14 @@ final class AppModel: ObservableObject {
 
     private var supportsSelectedTextTranslation: Bool {
         DistributionChannel.supportsSelectedTextTranslation
+    }
+
+    var selectedTextReplacementOperationID: UUID? {
+        selectedTextReplacementCoordinator.activeOperationID
+    }
+
+    var isWaitingForSelectedTextReplacementModifiers: Bool {
+        selectedTextReplacementCoordinator.operation?.phase == .waitingForModifiers
     }
 
     @MainActor
@@ -648,6 +694,12 @@ final class AppModel: ObservableObject {
         hotkeyManager.onPersistentRelease = { [weak self] in
             self?.handlePersistentSentenceOverlayRelease()
         }
+        bindHotkeyModifierObservation()
+        selectedTextReplacementOperationCancellable = selectedTextReplacementCoordinator.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+        hotkeyManager.start(singleKey: resolvedSettings.singleKey)
         paragraphHighlightWindowController.onResizeBegan = { [weak self] in
             Task { @MainActor in
                 self?.handleParagraphRegionResizeBegan()
@@ -664,7 +716,23 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func bindHotkeyModifierObservation() {
+        hotkeyManager.onModifierFlagsChanged = { [weak self] _ in
+            guard let self else { return }
+            if self.isWaitingForSelectedTextReplacementModifiers,
+               self.activeLookupMode == .selectedTextSentence {
+                self.isHotkeyActive = false
+                self.stopMouseTracking()
+            }
+            self.selectedTextReplacementCoordinator.modifiersDidChange()
+            if self.selectedTextReplacementCoordinator.isBusy {
+                self.syncOverlayDismissalMonitoring()
+            }
+        }
+    }
+
     func handleHotkeyTrigger() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         if #available(macOS 15.0, *) {
             ensureTranslationService()
         }
@@ -695,6 +763,12 @@ final class AppModel: ObservableObject {
     }
 
     private func finishHotkeyRelease(allowWordOverlayPersistence: Bool) {
+        if selectedTextReplacementCoordinator.isBusy {
+            debugOverlayWindowController.hide()
+            paragraphHighlightWindowController.hide()
+            return
+        }
+
         let shouldKeepSentenceOverlayVisible = isParagraphOverlayPinned && isSentenceTranslationPresented
         let shouldKeepTapOverlayVisible = allowWordOverlayPersistence
             && TapKeptOverlayPersistencePolicy.shouldKeepAfterTap(
@@ -730,6 +804,10 @@ final class AppModel: ObservableObject {
     }
 
     func handlePersistentSentenceOverlayRelease() {
+        if selectedTextReplacementCoordinator.isBusy {
+            return
+        }
+
         isHotkeyActive = false
         isTapKeptOverlayPresented = false
         tapKeptOverlayReleaseLocation = nil
@@ -761,6 +839,7 @@ final class AppModel: ObservableObject {
     }
 
     func handleHotkeyDoubleTap() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard isHotkeyActive else { return }
 
         let action = DoubleTapSentenceTranslationPolicy.resolve(
@@ -862,6 +941,7 @@ final class AppModel: ObservableObject {
     }
 
     func toggleParagraphOverlayPin() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         isParagraphOverlayPinned.toggle()
         if isParagraphOverlayPinned {
             armPersistentOverlayApplicationMonitoring()
@@ -873,22 +953,26 @@ final class AppModel: ObservableObject {
     }
 
     func beginParagraphOverlayDrag() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard isParagraphOverlayPresented, isParagraphOverlayPinned else { return }
         overlayWindowController.beginManualPositioning()
     }
 
     func updateParagraphOverlayDrag(translation: CGSize) {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard isParagraphOverlayPresented, isParagraphOverlayPinned else { return }
         overlayWindowController.moveBy(translation: translation)
     }
 
     func endParagraphOverlayDrag() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard isParagraphOverlayPresented, isParagraphOverlayPinned else { return }
         overlayWindowController.endManualPositioning()
         refreshParagraphOverlayLayoutImmediately()
     }
 
     func beginManualParagraphRegionSelection() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard isParagraphOverlayPresented else { return }
         beginManualParagraphRegionSelection(restoresOverlayOnCancel: true)
     }
@@ -913,6 +997,7 @@ final class AppModel: ObservableObject {
     }
 
     private func beginManualParagraphRegionSelection(restoresOverlayOnCancel: Bool) {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard permissions.status.screenRecording else {
             updateOverlay(state: .error(L("Enable Screen Recording")), anchor: overlayAnchor)
             return
@@ -1055,6 +1140,7 @@ final class AppModel: ObservableObject {
     }
 
     private func startLookup(at mouseLocation: CGPoint) {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         clearSelectedTextReplacementSession()
         activeLookupMode = .word
         hideInPlaceTranslation()
@@ -1088,6 +1174,7 @@ final class AppModel: ObservableObject {
     }
 
     private func startParagraphLookup() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         hideInPlaceTranslation()
         cancelActiveLookupWork()
         let lookupID = UUID()
@@ -1098,6 +1185,7 @@ final class AppModel: ObservableObject {
     }
 
     private func handleParagraphRegionResizeBegan() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         isParagraphRegionInteractionActive = true
         overlayWindowController.hideWindowOnly()
         hideInPlaceTranslation()
@@ -1105,6 +1193,7 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     private func handleParagraphRegionResizeCompleted(_ rect: CGRect) -> Bool {
+        guard !selectedTextReplacementCoordinator.isBusy else { return false }
         isParagraphRegionInteractionActive = false
         guard rect.width > 0, rect.height > 0 else { return false }
         guard permissions.status.screenRecording else {
@@ -2325,6 +2414,7 @@ final class AppModel: ObservableObject {
     }
 
     func translateParagraphOriginal(to targetIdentifier: String) {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard case .paragraphResult(let content) = overlayState,
               content.selectedTargetLanguageIdentifier != targetIdentifier,
               let sourceIdentifier = content.sourceLanguageIdentifier,
@@ -2346,6 +2436,7 @@ final class AppModel: ObservableObject {
     }
 
     func updateParagraphOriginalText(_ text: String) {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         clearSelectedTextReplacementSession()
         updateParagraphOverlayContentIgnoringLookup(anchor: overlayAnchor) { content in
             content.originalText = text
@@ -2354,6 +2445,7 @@ final class AppModel: ObservableObject {
     }
 
     func invalidateSelectedTextReplacement() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         if case .paragraphResult(var content) = overlayState {
             content.isManualInputFallback = true
             overlayState = .paragraphResult(content)
@@ -2362,7 +2454,8 @@ final class AppModel: ObservableObject {
     }
 
     func showsSelectedTextReplacement(using sourceType: SentenceTranslationSource.SourceType) -> Bool {
-        guard SelectedTextReplacementPolicy.shouldShowButton(
+        guard selectedTextReplacementSession != nil,
+              SelectedTextReplacementPolicy.shouldShowButton(
                 supportsChannel: supportsSelectedTextTranslation,
                 isSelectedTextResult: activeLookupMode == .selectedTextSentence,
                 isTranslationComplete: true
@@ -2396,8 +2489,31 @@ final class AppModel: ObservableObject {
         return consumedReplacementSessionIDs.contains(session.id)
     }
 
+    private func isReplacementRequestCurrent(_ request: SelectedTextReplacementRequest) -> Bool {
+        supportsSelectedTextTranslation
+            && permissions.status.accessibility
+            && activeLookupMode == .selectedTextSentence
+            && selectedTextReplacementSession?.id == request.session.id
+            && activeLookupID == request.lookupID
+            && !consumedReplacementSessionIDs.contains(request.session.id)
+            && {
+                guard case .paragraphResult(let content) = overlayState,
+                      !content.isRetranslating else { return false }
+                switch request.sourceType {
+                case .native:
+                    guard case .ready(let text) = content.translationState else { return false }
+                    return text == request.translatedText
+                default:
+                    guard let result = content.serviceResults.first(where: { $0.sourceType == request.sourceType }),
+                          result.isComplete,
+                          case .ready(let text) = result.state else { return false }
+                    return text == request.translatedText
+                }
+            }()
+    }
+
     func replaceSelectedText(using sourceType: SentenceTranslationSource.SourceType) {
-        guard selectedTextReplacementOperationID == nil,
+        guard !selectedTextReplacementCoordinator.isBusy,
               !isSelectedTextReplacementConsumed,
               showsSelectedTextReplacement(using: sourceType),
               case .paragraphResult(let content) = overlayState else {
@@ -2428,68 +2544,76 @@ final class AppModel: ObservableObject {
         }
 
         guard !translatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let operationID = UUID()
-        selectedTextReplacementOperationID = operationID
+        guard let lookupID = activeLookupID else { return }
+        let request = SelectedTextReplacementRequest(
+            operationID: UUID(),
+            session: session,
+            lookupID: lookupID,
+            sourceType: sourceType,
+            translatedText: translatedText
+        )
+        guard selectedTextReplacementCoordinator.submitImmediately(request) else { return }
         selectedTextReplacementFeedback = nil
+        syncOverlayDismissalMonitoring()
+        isHotkeyActive = false
+        stopMouseTracking()
+    }
 
-        selectedTextReplacementTask = Task { [weak self] in
-            guard let self else { return }
-            do {
-                let outcome = try await selectedTextReplacementService.replace(
-                    session: session,
-                    translatedText: translatedText,
-                    hideOverlay: { [weak self] in
-                        self?.overlayWindowController.hideWindowOnly()
-                    }
-                )
-                guard self.selectedTextReplacementOperationID == operationID else {
-                    return
+    private func finishSelectedTextReplacement(
+        _ request: SelectedTextReplacementRequest,
+        result: Result<SelectedTextReplacementOutcome, Error>
+    ) {
+        guard selectedTextReplacementSession?.id == request.session.id,
+              activeLookupID == request.lookupID else {
+            Task {
+                await selectedTextService.releaseReplacementContext(request.session.contextID)
+            }
+            return
+        }
+
+        switch result {
+        case .success(.verified), .success(.pasteDispatched):
+            consumedReplacementSessionIDs.insert(request.session.id)
+            cancelActiveLookupWork()
+            finishSelectedTextReplacementSession(request.session)
+            Task {
+                await selectedTextService.releaseReplacementContext(request.session.contextID)
+            }
+            hideOverlay()
+        case .failure(let failure as SelectedTextReplacementFailure):
+            guard selectedTextReplacementSession?.id == request.session.id,
+                  activeLookupID == request.lookupID else { return }
+            let frontmostProcessIdentifier = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            guard frontmostProcessIdentifier == request.session.sourceProcessIdentifier
+                    || frontmostProcessIdentifier == ProcessInfo.processInfo.processIdentifier else {
+                clearSelectedTextReplacementSession()
+                hideOverlay()
+                Task {
+                    await selectedTextService.releaseReplacementContext(request.session.contextID)
                 }
-                switch outcome {
-                case .verified:
-                    if self.selectedTextReplacementSession?.id == session.id {
-                        self.consumedReplacementSessionIDs.insert(session.id)
-                        self.selectedTextReplacementFeedback = nil
-                        self.dismissOverlay()
-                    } else {
-                        Task {
-                            await self.selectedTextService.releaseReplacementContext(session.contextID)
-                        }
-                    }
-                case .pasteDispatched:
-                    self.consumedReplacementSessionIDs.insert(session.id)
-                    if self.selectedTextReplacementSession?.id == session.id {
-                        self.selectedTextReplacementFeedback = L("Replacement was sent. Check the original app.")
-                        self.showSelectedTextReplacementFeedback()
-                    } else {
-                        self.consumedReplacementSessionIDs.remove(session.id)
-                        Task {
-                            await self.selectedTextService.releaseReplacementContext(session.contextID)
-                        }
-                    }
-                }
-            } catch let failure as SelectedTextReplacementFailure {
-                if self.selectedTextReplacementOperationID == operationID,
-                   self.selectedTextReplacementSession?.id == session.id {
-                    self.selectedTextReplacementFeedback = L(failure.localizationKey)
-                    if failure == .sourceChanged || failure == .selectionChanged || failure == .targetUnavailable {
-                        self.clearSelectedTextReplacementSession(clearFeedback: false)
-                    }
-                    self.showSelectedTextReplacementFeedback()
-                }
-            } catch is CancellationError {
-                // Dismissal and target changes invalidate this operation.
-            } catch {
-                if self.selectedTextReplacementOperationID == operationID,
-                   self.selectedTextReplacementSession?.id == session.id {
-                    self.selectedTextReplacementFeedback = L("Unable to send the replacement.")
-                    self.showSelectedTextReplacementFeedback()
+                return
+            }
+            isHotkeyActive = false
+            stopMouseTracking()
+            selectedTextReplacementFeedback = L(failure.localizationKey)
+            if failure == .sourceChanged || failure == .selectionChanged || failure == .targetUnavailable {
+                finishSelectedTextReplacementSession(request.session, clearFeedback: false)
+                Task {
+                    await selectedTextService.releaseReplacementContext(request.session.contextID)
                 }
             }
-            if self.selectedTextReplacementOperationID == operationID {
-                self.selectedTextReplacementOperationID = nil
-                self.selectedTextReplacementTask = nil
-            }
+            keepOverlayAfterTap()
+            showSelectedTextReplacementFeedback(for: request)
+        case .failure(is CancellationError):
+            break
+        case .failure:
+            guard selectedTextReplacementSession?.id == request.session.id,
+                  activeLookupID == request.lookupID else { return }
+            isHotkeyActive = false
+            stopMouseTracking()
+            keepOverlayAfterTap()
+            selectedTextReplacementFeedback = L("Unable to send the replacement.")
+            showSelectedTextReplacementFeedback(for: request)
         }
     }
 
@@ -2510,19 +2634,33 @@ final class AppModel: ObservableObject {
         )
     }
 
-    private func clearSelectedTextReplacementSession(clearFeedback: Bool = true) {
-        let previousSession = selectedTextReplacementSession
-        selectedTextReplacementTask?.cancel()
-        let hadActiveOperation = selectedTextReplacementOperationID != nil
-        selectedTextReplacementTask = nil
+    private func finishSelectedTextReplacementSession(
+        _ session: SelectedTextReplacementSession,
+        clearFeedback: Bool = true
+    ) {
+        guard selectedTextReplacementSession?.id == session.id else { return }
         selectedTextReplacementSession = nil
-        if !hadActiveOperation {
-            selectedTextReplacementOperationID = nil
-        }
         if clearFeedback {
             selectedTextReplacementFeedback = nil
         }
-        if let previousSession {
+        consumedReplacementSessionIDs.remove(session.id)
+    }
+
+    private func clearSelectedTextReplacementSession(clearFeedback: Bool = true) {
+        let previousSession = selectedTextReplacementSession
+        let operationOwnsSession = previousSession.map {
+            selectedTextReplacementCoordinator.ownsContext(for: $0.id)
+        } ?? false
+        if operationOwnsSession,
+           selectedTextReplacementCoordinator.activeRequest?.lookupID == activeLookupID {
+            cancelActiveLookupWork()
+        }
+        selectedTextReplacementSession = nil
+        if clearFeedback {
+            selectedTextReplacementFeedback = nil
+        }
+        selectedTextReplacementCoordinator.cancel()
+        if let previousSession, !operationOwnsSession {
             consumedReplacementSessionIDs.remove(previousSession.id)
             Task {
                 await selectedTextService.releaseReplacementContext(previousSession.contextID)
@@ -2530,13 +2668,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func showSelectedTextReplacementFeedback() {
-        guard case .paragraphResult = overlayState else { return }
+    private func showSelectedTextReplacementFeedback(for request: SelectedTextReplacementRequest) {
+        guard activeLookupID == request.lookupID,
+              case .paragraphResult = overlayState else { return }
+        cancelPendingOverlayLayoutRefresh()
         overlayWindowController.show(at: overlayAnchor, makeKey: false)
         overlayWindowController.setInteractive(true, requestsKeyboardFocus: false)
     }
 
     func submitParagraphOriginalText() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard case .paragraphResult(let content) = overlayState,
               let originalText = content.originalText?.trimmingCharacters(in: .whitespacesAndNewlines),
               !originalText.isEmpty else {
@@ -2566,13 +2707,12 @@ final class AppModel: ObservableObject {
         languagePair: LookupLanguagePair,
         selectedTargetLanguageIdentifier: String
     ) {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         let originalText = originalText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !originalText.isEmpty else { return }
 
         paragraphTranslationTask?.cancel()
-        if selectedTextReplacementOperationID != nil {
-            selectedTextReplacementTask?.cancel()
-        }
+        selectedTextReplacementCoordinator.cancel()
         selectedTextReplacementFeedback = nil
         let lookupID = UUID()
         activeLookupID = lookupID
@@ -3046,6 +3186,7 @@ final class AppModel: ObservableObject {
         }
 
         let wasWindowVisible = overlayWindowController.isVisible
+        let pauseReplacementPresentation = isSelectedTextReplacementPresentationPaused
 
         switch state {
         case .error(let message):
@@ -3054,17 +3195,19 @@ final class AppModel: ObservableObject {
             break
         case .paragraphLoading, .paragraphResult:
             publishOverlayStateIfNeeded(state, wasWindowVisible: wasWindowVisible)
-            if overlayWindowController.isVisible {
-                refreshParagraphOverlayLayoutImmediately()
-            } else {
-                showOverlayWindowForActiveLookup(
-                    makeKey: isParagraphOverlayPresented && activeLookupMode != .selectedTextSentence
+            if !pauseReplacementPresentation {
+                if overlayWindowController.isVisible {
+                    refreshParagraphOverlayLayoutImmediately()
+                } else {
+                    showOverlayWindowForActiveLookup(
+                        makeKey: isParagraphOverlayPresented && activeLookupMode != .selectedTextSentence
+                    )
+                }
+                overlayWindowController.setInteractive(
+                    true,
+                    requestsKeyboardFocus: activeLookupMode != .selectedTextSentence
                 )
             }
-            overlayWindowController.setInteractive(
-                true,
-                requestsKeyboardFocus: activeLookupMode != .selectedTextSentence
-            )
         case .result:
             publishOverlayStateIfNeeded(state, wasWindowVisible: wasWindowVisible)
             if overlayWindowController.isVisible {
@@ -3118,6 +3261,7 @@ final class AppModel: ObservableObject {
     }
 
     private func showOverlayWindowForActiveLookup(makeKey: Bool) {
+        guard !isSelectedTextReplacementPresentationPaused else { return }
         let trace = activeLookupTrace
         overlayWindowController.show(
             at: overlayAnchor,
@@ -3127,6 +3271,12 @@ final class AppModel: ObservableObject {
                 lookupPerformanceReporter.mark(.panelPresentation, trace: trace)
             }
         )
+    }
+
+    private var isSelectedTextReplacementPresentationPaused: Bool {
+        guard let operation = selectedTextReplacementCoordinator.operation else { return false }
+        return selectedTextReplacementSession?.id == operation.request.session.id
+            && activeLookupID == operation.request.lookupID
     }
 
     private func sendNotification(title: String, body: String) {
@@ -3140,7 +3290,18 @@ final class AppModel: ObservableObject {
     private func bindSettings() {
         settings.$singleKey
             .sink { [weak self] singleKey in
-                self?.hotkeyManager.start(singleKey: singleKey)
+                guard let self else { return }
+                if self.selectedTextReplacementCoordinator.isBusy {
+                    self.clearSelectedTextReplacementSession()
+                }
+                self.hotkeyManager.start(singleKey: singleKey)
+                self.hotkeyManager.onTrigger = { [weak self] in self?.handleHotkeyTrigger() }
+                self.hotkeyManager.onRelease = { [weak self] in self?.handleHotkeyRelease() }
+                self.hotkeyManager.onTapRelease = { [weak self] in self?.handleHotkeyTapRelease() }
+                self.hotkeyManager.onDoubleTap = { [weak self] in self?.handleHotkeyDoubleTap() }
+                self.hotkeyManager.onPersistentRelease = { [weak self] in self?.handlePersistentSentenceOverlayRelease() }
+                self.bindHotkeyModifierObservation()
+                self.hotkeyManager.consumeCurrentGesture()
             }
             .store(in: &cancellables)
 
@@ -3170,8 +3331,13 @@ final class AppModel: ObservableObject {
 
         permissions.$status
             .sink { [weak self] status in
+                guard let self else { return }
+                if !status.accessibility,
+                   self.selectedTextReplacementCoordinator.isBusy {
+                    self.clearSelectedTextReplacementSession()
+                }
                 if status.screenRecording {
-                    self?.restartHotkey()
+                    self.restartHotkey()
                 }
             }
             .store(in: &cancellables)
@@ -3187,6 +3353,23 @@ final class AppModel: ObservableObject {
         workspaceNotifications.publisher(for: NSWorkspace.didActivateApplicationNotification)
             .sink { [weak self] notification in
                 self?.handleApplicationActivation(notification)
+            }
+            .store(in: &cancellables)
+
+        workspaceNotifications.publisher(for: NSWorkspace.didTerminateApplicationNotification)
+            .sink { [weak self] notification in
+                guard let self,
+                      let application = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                      self.selectedTextReplacementCoordinator.activeRequest?.session.sourceProcessIdentifier
+                        == application.processIdentifier else {
+                    return
+                }
+                self.clearSelectedTextReplacementSession()
+                if self.selectedTextReplacementCoordinator.operation != nil {
+                    self.overlayWindowController.hideWindowOnly()
+                } else {
+                    self.hideOverlay()
+                }
             }
             .store(in: &cancellables)
 
@@ -3236,6 +3419,10 @@ final class AppModel: ObservableObject {
     private func handleActiveSpaceChange() {
         captureService.invalidateCache()
 
+        if selectedTextReplacementCoordinator.isBusy {
+            return
+        }
+
         guard isHotkeyActive || isParagraphOverlayPresented || isTapKeptOverlayPresented else {
             return
         }
@@ -3255,6 +3442,12 @@ final class AppModel: ObservableObject {
         if let session = selectedTextReplacementSession,
            application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
            application.processIdentifier != session.sourceProcessIdentifier {
+            clearSelectedTextReplacementSession()
+        }
+
+        if let request = selectedTextReplacementCoordinator.activeRequest,
+           application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+           application.processIdentifier != request.session.sourceProcessIdentifier {
             clearSelectedTextReplacementSession()
         }
 
@@ -3287,6 +3480,7 @@ final class AppModel: ObservableObject {
     }
 
     private func recoverAfterSystemWake() {
+        clearSelectedTextReplacementSession()
         isHotkeyActive = false
         hotkeyManager.resetState()
         stopMouseTracking()
@@ -3308,10 +3502,17 @@ final class AppModel: ObservableObject {
            case .paragraphResult = overlayState {
             debounceWorkItem?.cancel()
             debounceWorkItem = nil
-            let replacementTask = selectedTextReplacementTask
-            let sessionID = selectedTextReplacementSession?.id
-            let configuration = SelectedTextScreenConfiguration.capture()
-            replacementTask?.cancel()
+            if selectedTextReplacementCoordinator.isBusy {
+                clearSelectedTextReplacementSession()
+                if selectedTextReplacementCoordinator.isBusy {
+                    overlayWindowController.hideWindowOnly()
+                } else if activeLookupMode == .selectedTextSentence {
+                    isHotkeyActive = false
+                    stopMouseTracking()
+                    keepOverlayAfterTap()
+                }
+                return
+            }
             let anchor = NSEvent.mouseLocation
             setOverlayAnchor(anchor)
             lastOcrPosition = anchor
@@ -3321,18 +3522,6 @@ final class AppModel: ObservableObject {
             if overlayWindowController.isVisible {
                 overlayWindowController.move(to: anchor)
                 overlayWindowController.refreshLayoutIfNeeded(at: anchor)
-            }
-            if let replacementTask {
-                Task { [weak self] in
-                    await replacementTask.value
-                    guard let self,
-                          sessionID != nil, self.selectedTextReplacementSession?.id == sessionID,
-                          self.selectedTextReplacementOperationID == nil,
-                          configuration == SelectedTextScreenConfiguration.capture(),
-                          self.activeLookupMode == .selectedTextSentence,
-                          case .paragraphResult = self.overlayState else { return }
-                    self.showSelectedTextReplacementFeedback()
-                }
             }
             return
         }
@@ -3353,11 +3542,13 @@ final class AppModel: ObservableObject {
     }
 
     private func restartHotkey() {
+        guard !selectedTextReplacementCoordinator.isBusy else { return }
         guard !isHotkeyActive else { return }
         hotkeyManager.start(singleKey: settings.singleKey)
     }
 
     private func handleTranslationSettingsChanged() {
+        clearSelectedTextReplacementSession()
         cancelActiveLookupWork()
         lastAvailabilityKey = nil
         cachedLanguageStatuses.removeAll()
@@ -4179,7 +4370,8 @@ final class AppModel: ObservableObject {
             stopOverlayEscapeMonitoring()
         }
 
-        if isSentenceTranslationPresented && isParagraphOverlayPinned {
+        if (isSentenceTranslationPresented && isParagraphOverlayPinned)
+            || isWaitingForSelectedTextReplacementModifiers {
             startParagraphOutsideClickMonitoringIfNeeded()
         } else {
             stopParagraphOutsideClickMonitoring()
@@ -4226,6 +4418,9 @@ final class AppModel: ObservableObject {
             isTapKeptOverlayPresented: isTapKeptOverlayPresented
         ) else { return false }
 
+        if selectedTextReplacementCoordinator.operation?.phase == .pasteDispatched {
+            return false
+        }
         dismissOverlay()
         return true
     }
@@ -4263,6 +4458,20 @@ final class AppModel: ObservableObject {
 
     @discardableResult
     private func handleParagraphOutsideMouseDown() -> Bool {
+        if isWaitingForSelectedTextReplacementModifiers {
+            let isInsideProtectedFrame: Bool = [
+                overlayWindowController.visibleFrame,
+                paragraphHighlightWindowController.visibleFrame,
+                activeParagraphRect,
+            ].contains { frame in
+                guard let frame, !frame.isNull, !frame.isEmpty else { return false }
+                return frame.insetBy(dx: -8, dy: -8).contains(NSEvent.mouseLocation)
+            }
+            guard !isInsideProtectedFrame else { return false }
+            dismissOverlay()
+            return true
+        }
+
         let shouldDismiss = ParagraphOutsideClickDismissalPolicy.shouldDismiss(
             mouseLocation: NSEvent.mouseLocation,
             isSentenceTranslationPresented: isSentenceTranslationPresented,

@@ -190,6 +190,92 @@ final class HotkeyManagerTests: XCTestCase {
         await fulfillment(of: [released], timeout: 2)
     }
 
+    @MainActor
+    func testConsumedHeldGestureDoesNotReleaseAndAllowsNextPress() throws {
+        var scheduledWorkItems: [DispatchWorkItem] = []
+        let manager = HotkeyManager { workItem, _ in
+            scheduledWorkItems.append(workItem)
+        }
+        manager.start(singleKey: .rightOption)
+        defer { manager.stop() }
+        var triggerCount = 0
+        var releaseCount = 0
+        manager.onTrigger = { triggerCount += 1 }
+        manager.onRelease = { releaseCount += 1 }
+        let option = NSEvent.ModifierFlags(rawValue: UInt(NX_DEVICERALTKEYMASK)).union(.option)
+
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 61, flags: option))
+        XCTAssertEqual(triggerCount, 1)
+        manager.consumeCurrentGesture()
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 61, flags: []))
+
+        XCTAssertEqual(releaseCount, 0)
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 61, flags: option))
+        XCTAssertEqual(triggerCount, 2)
+        XCTAssertTrue(scheduledWorkItems.isEmpty)
+    }
+
+    @MainActor
+    func testConsumedGestureInvalidatesAlreadyScheduledRelease() throws {
+        var scheduledWorkItems: [DispatchWorkItem] = []
+        let manager = HotkeyManager { workItem, _ in
+            scheduledWorkItems.append(workItem)
+        }
+        manager.start(singleKey: .rightOption)
+        defer { manager.stop() }
+        var releaseCount = 0
+        manager.onRelease = { releaseCount += 1 }
+        let option = NSEvent.ModifierFlags(rawValue: UInt(NX_DEVICERALTKEYMASK)).union(.option)
+        let start = Date()
+
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 61, flags: option), now: start)
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 61, flags: []), now: start.addingTimeInterval(0.30))
+        XCTAssertEqual(scheduledWorkItems.count, 1)
+
+        manager.consumeCurrentGesture()
+        scheduledWorkItems[0].perform()
+
+        XCTAssertEqual(releaseCount, 0)
+    }
+
+    @MainActor
+    func testModifierObserverCanConsumeReleaseScheduledBySameEvent() throws {
+        var scheduledWorkItems: [DispatchWorkItem] = []
+        let manager = HotkeyManager { workItem, _ in
+            scheduledWorkItems.append(workItem)
+        }
+        manager.start(singleKey: .rightOption)
+        defer { manager.stop() }
+        var releaseCount = 0
+        manager.onRelease = { releaseCount += 1 }
+        manager.onModifierFlagsChanged = { [weak manager] _ in
+            manager?.consumeCurrentRelease()
+        }
+        let option = NSEvent.ModifierFlags(rawValue: UInt(NX_DEVICERALTKEYMASK)).union(.option)
+        let start = Date()
+
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 61, flags: option), now: start)
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 61, flags: []), now: start.addingTimeInterval(0.30))
+
+        XCTAssertEqual(scheduledWorkItems.count, 1)
+        scheduledWorkItems[0].perform()
+        XCTAssertEqual(releaseCount, 0)
+    }
+
+    @MainActor
+    func testModifierChangesAreObservedEvenForOtherPhysicalKeys() throws {
+        let manager = HotkeyManager()
+        manager.start(singleKey: .rightOption)
+        defer { manager.stop() }
+        var observedFlags: [NSEvent.ModifierFlags] = []
+        manager.onModifierFlagsChanged = { observedFlags.append($0) }
+        let command = NSEvent.ModifierFlags(rawValue: UInt(NX_DEVICELCMDKEYMASK)).union(.command)
+
+        manager.handleFlagsChanged(try modifierEvent(keyCode: 55, flags: command))
+
+        XCTAssertEqual(observedFlags, [command])
+    }
+
     private func modifierEvent(keyCode: UInt16, flags: NSEvent.ModifierFlags) throws -> NSEvent {
         try XCTUnwrap(NSEvent.keyEvent(
             with: .flagsChanged,

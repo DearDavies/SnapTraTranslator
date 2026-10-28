@@ -7,19 +7,26 @@ import Foundation
 final class SelectedTextReplacementService {
     private let selectedTextService: SelectedTextService
     private let pasteboardCoordinator: PasteboardCoordinator
+    private let waitForPasteVerificationInterval: @MainActor () async -> Void
 
     init(
         selectedTextService: SelectedTextService,
-        pasteboardCoordinator: PasteboardCoordinator
+        pasteboardCoordinator: PasteboardCoordinator,
+        waitForPasteVerificationInterval: @escaping @MainActor () async -> Void = {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
     ) {
         self.selectedTextService = selectedTextService
         self.pasteboardCoordinator = pasteboardCoordinator
+        self.waitForPasteVerificationInterval = waitForPasteVerificationInterval
     }
 
     func replace(
         session: SelectedTextReplacementSession,
         translatedText: String,
-        hideOverlay: @MainActor () -> Void
+        allowsHeldModifiers: Bool = false,
+        hideOverlay: @MainActor () -> Void,
+        onPasteDispatched: @MainActor () -> Void
     ) async throws -> SelectedTextReplacementOutcome {
         guard DistributionChannel.supportsSelectedTextTranslation else {
             throw SelectedTextReplacementFailure.unsupportedChannel
@@ -53,8 +60,9 @@ final class SelectedTextReplacementService {
         }
         var ownedChangeCount = backup.changeCount
         var didDispatchPaste = false
+        var shouldRestorePasteboard = true
         defer {
-            if !didDispatchPaste, ownedChangeCount != backup.changeCount {
+            if shouldRestorePasteboard, !didDispatchPaste, ownedChangeCount != backup.changeCount {
                 pasteboardCoordinator.restore(
                     backup,
                     using: lease,
@@ -63,12 +71,11 @@ final class SelectedTextReplacementService {
             }
         }
 
-        try Task.checkCancellation()
-        hideOverlay()
-
         guard let sourceApplication = NSRunningApplication(processIdentifier: processIdentifier) else {
             throw SelectedTextReplacementFailure.targetUnavailable
         }
+        try Task.checkCancellation()
+        hideOverlay()
         sourceApplication.activate(options: [])
 
         var targetIsFocused = false
@@ -93,14 +100,8 @@ final class SelectedTextReplacementService {
             throw SelectedTextReplacementFailure.focusTimedOut
         }
 
-        for _ in 0..<20 {
-            try Task.checkCancellation()
-            if NSEvent.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty {
-                break
-            }
-            try await Task.sleep(nanoseconds: 25_000_000)
-        }
-        guard NSEvent.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty else {
+        guard allowsHeldModifiers
+                || NSEvent.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty else {
             throw SelectedTextReplacementFailure.modifiersStillPressed
         }
 
@@ -109,8 +110,7 @@ final class SelectedTextReplacementService {
             frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier
         )
 
-        let pasteboard = NSPasteboard.general
-        guard pasteboard.changeCount == backup.changeCount else {
+        guard pasteboardCoordinator.changeCount == backup.changeCount else {
             throw SelectedTextReplacementFailure.clipboardChanged
         }
         guard let write = pasteboardCoordinator.write(
@@ -124,7 +124,7 @@ final class SelectedTextReplacementService {
         guard write.succeeded else {
             throw SelectedTextReplacementFailure.eventCreationFailed
         }
-        guard pasteboard.changeCount == ownedChangeCount else {
+        guard pasteboardCoordinator.changeCount == ownedChangeCount else {
             throw SelectedTextReplacementFailure.clipboardChanged
         }
 
@@ -134,7 +134,7 @@ final class SelectedTextReplacementService {
             frontmostProcessIdentifier: NSWorkspace.shared.frontmostApplication?.processIdentifier
         )
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier,
-              pasteboard.changeCount == ownedChangeCount else {
+              pasteboardCoordinator.changeCount == ownedChangeCount else {
             throw SelectedTextReplacementFailure.selectionChanged
         }
 
@@ -151,17 +151,23 @@ final class SelectedTextReplacementService {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == processIdentifier else {
             throw SelectedTextReplacementFailure.sourceChanged
         }
-        guard pasteboard.changeCount == ownedChangeCount else {
+        guard pasteboardCoordinator.changeCount == ownedChangeCount else {
             throw SelectedTextReplacementFailure.clipboardChanged
+        }
+        guard allowsHeldModifiers
+                || NSEvent.modifierFlags.intersection([.command, .option, .control, .shift, .function]).isEmpty else {
+            throw SelectedTextReplacementFailure.modifiersStillPressed
         }
         keyDown.flags = .maskCommand
         keyUp.flags = .maskCommand
         didDispatchPaste = true
         keyDown.post(tap: .cghidEventTap)
         keyUp.post(tap: .cghidEventTap)
+        onPasteDispatched()
 
         for _ in 0..<10 {
-            if pasteboard.changeCount != ownedChangeCount {
+            if pasteboardCoordinator.changeCount != ownedChangeCount {
+                shouldRestorePasteboard = false
                 return .pasteDispatched
             }
             if await selectedTextService.replacementTextMatches(
@@ -178,20 +184,8 @@ final class SelectedTextReplacementService {
             await waitForPasteVerificationInterval()
         }
 
-        pasteboardCoordinator.restore(
-            backup,
-            using: lease,
-            ifChangeCount: ownedChangeCount
-        )
+        shouldRestorePasteboard = false
         return .pasteDispatched
-    }
-
-    private func waitForPasteVerificationInterval() async {
-        await withCheckedContinuation { continuation in
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-                continuation.resume()
-            }
-        }
     }
 
 }

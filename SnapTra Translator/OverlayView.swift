@@ -411,7 +411,14 @@ struct OverlayView: View {
                         }
                     }
 
-                    if let feedback = model.selectedTextReplacementFeedback {
+                    if model.isWaitingForSelectedTextReplacementModifiers {
+                        Text(L("Release shortcut keys to replace."))
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.horizontal, paragraphTextHorizontalPadding)
+                            .padding(.vertical, 8)
+                    } else if let feedback = model.selectedTextReplacementFeedback {
                         Text(feedback)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(.secondary)
@@ -460,6 +467,7 @@ struct OverlayView: View {
                 },
                 onSubmit: { model.submitParagraphOriginalText() }
             )
+            .disabled(model.selectedTextReplacementOperationID != nil)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
             .background(
@@ -558,6 +566,7 @@ struct OverlayView: View {
                 .padding(.vertical, isCompact ? 3 : 5)
             }
             .buttonStyle(.plain)
+            .disabled(model.selectedTextReplacementOperationID != nil)
             .layoutPriority(1)
             .accessibilityLabel(Text(L("Toggle translation direction")))
             .padding(isCompact ? 1 : 2)
@@ -683,8 +692,8 @@ struct OverlayView: View {
         }
         .buttonStyle(.plain)
         .disabled(model.selectedTextReplacementOperationID != nil || model.isSelectedTextReplacementConsumed)
-        .help(L("Replace Original"))
-        .accessibilityLabel(L("Replace Original"))
+        .help(model.isWaitingForSelectedTextReplacementModifiers ? L("Release shortcut keys to replace.") : L("Replace Original"))
+        .accessibilityLabel(model.isWaitingForSelectedTextReplacementModifiers ? L("Release shortcut keys to replace.") : L("Replace Original"))
     }
 
     private static func formatTranslationDuration(_ duration: TimeInterval) -> String {

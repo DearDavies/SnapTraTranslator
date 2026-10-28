@@ -356,6 +356,30 @@ final class SelectedTextReplacementTests: XCTestCase {
         XCTAssertNotNil(coordinator.acquire())
     }
 
+    @MainActor
+    func testPasteboardCoordinatorUsesInjectedPasteboard() throws {
+        let pasteboardName = NSPasteboard.Name("SnapTraTests.\(UUID().uuidString)")
+        let pasteboard = NSPasteboard(name: pasteboardName)
+        defer { pasteboard.releaseGlobally() }
+        pasteboard.clearContents()
+        XCTAssertTrue(pasteboard.setString("backup", forType: .string))
+
+        let coordinator = PasteboardCoordinator(pasteboard: pasteboard)
+        let lease = try XCTUnwrap(coordinator.acquire())
+        let snapshot = try XCTUnwrap(coordinator.capture(using: lease))
+        let write = try XCTUnwrap(coordinator.write(
+            "translated",
+            using: lease,
+            expectedChangeCount: snapshot.changeCount
+        ))
+        XCTAssertEqual(coordinator.changeCount, write.changeCount)
+        XCTAssertEqual(pasteboard.string(forType: .string), "translated")
+
+        XCTAssertTrue(coordinator.restore(snapshot, using: lease, ifChangeCount: write.changeCount))
+        XCTAssertEqual(pasteboard.string(forType: .string), "backup")
+        coordinator.release(lease)
+    }
+
     private func canCapture(
         range: NSRange,
         text: String,

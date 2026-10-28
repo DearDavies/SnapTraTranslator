@@ -9994,6 +9994,41 @@
         }
       }
     },
+    "Release shortcut keys to replace." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Release shortcut keys to replace."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "置換するにはショートカットキーを放してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "바꾸려면 단축키를 놓으세요."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "松开快捷键以替换。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "放開快捷鍵以取代。"
+          }
+        }
+      }
+    },
     "Unable to send the replacement." : {
       "extractionState" : "manual",
       "localizations" : {

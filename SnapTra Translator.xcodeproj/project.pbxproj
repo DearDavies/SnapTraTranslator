@@ -20,6 +20,7 @@
 		ACEEECDABF8040D4B09377C9 /* LookupPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4D1C751B70E94ABC9BCA765A /* LookupPerformanceTests.swift */; };
 		D300F5E82F67AE35007DD703 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = E1SPARKLE000000000000002 /* Sparkle */; };
 		E1A111111111111111111111 /* HotkeyManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1B111111111111111111111 /* HotkeyManagerTests.swift */; };
+		E1A444444444444444444444 /* SelectedTextReplacementCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1B444444444444444444444 /* SelectedTextReplacementCoordinatorTests.swift */; };
 		E1A222222222222222222222 /* OCRParagraphGroupingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1B222222222222222222222 /* OCRParagraphGroupingTests.swift */; };
 		E1A333333333333333333333 /* ParagraphOverlayLayoutTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E1B333333333333333333333 /* ParagraphOverlayLayoutTests.swift */; };
 /* End PBXBuildFile section */
@@ -49,6 +50,7 @@
 		D0878597B29F37191DDAD9BF /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
 		D3F4D8FE2F14D1A2004035A9 /* SnapTra Translator.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "SnapTra Translator.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		E1B111111111111111111111 /* HotkeyManagerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = HotkeyManagerTests.swift; sourceTree = "<group>"; };
+		E1B444444444444444444444 /* SelectedTextReplacementCoordinatorTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = SelectedTextReplacementCoordinatorTests.swift; sourceTree = "<group>"; };
 		E1B222222222222222222222 /* OCRParagraphGroupingTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = OCRParagraphGroupingTests.swift; sourceTree = "<group>"; };
 		E1B333333333333333333333 /* ParagraphOverlayLayoutTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ParagraphOverlayLayoutTests.swift; sourceTree = "<group>"; };
 		E1D111111111111111111111 /* SnapTra Translator Direct.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; name = "SnapTra Translator Direct.app"; path = "SnapTra Translator.app"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -134,6 +136,7 @@
 				A9757C4D27EFDE23144043C9 /* SettingsStoreTests.swift */,
 				5D5A00000000000000000002 /* InPlaceTranslationLayoutTests.swift */,
 				E1B111111111111111111111 /* HotkeyManagerTests.swift */,
+				E1B444444444444444444444 /* SelectedTextReplacementCoordinatorTests.swift */,
 				E1B222222222222222222222 /* OCRParagraphGroupingTests.swift */,
 				E1B333333333333333333333 /* ParagraphOverlayLayoutTests.swift */,
 			);
@@ -320,6 +323,7 @@
 				A7C81D2E3F405162738495A7 /* SpeechServiceTests.swift in Sources */,
 				246061597EB29A21F9316CDF /* SettingsStoreTests.swift in Sources */,
 				E1A111111111111111111111 /* HotkeyManagerTests.swift in Sources */,
+				E1A444444444444444444444 /* SelectedTextReplacementCoordinatorTests.swift in Sources */,
 				E1A222222222222222222222 /* OCRParagraphGroupingTests.swift in Sources */,
 				E1A333333333333333333333 /* ParagraphOverlayLayoutTests.swift in Sources */,
 			);
